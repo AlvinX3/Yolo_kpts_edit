@@ -4,11 +4,13 @@ main.py - Pose Annotation Tool: window, drawing, input handling and workflow con
 Workflow: choose "Video / Folder" -> Open Source -> Open Pose JSON (or "Estimate" to run YOLO)
           -> review frame by frame -> drag joints / add skeletons -> Save
 Mouse:    left-drag a joint | right-click a joint = toggle visible / invisible
-Keys:     Left / Right = previous / next frame | Ctrl+S = save | Ctrl+Z = undo
+          mouse wheel = magnifier zoom
+Keys:     Left / Right = previous / next frame | M = magnifier on / off
+          Ctrl+S = save | Ctrl+Z = undo
 
 Modules:
   file_reader.py : frame sources, pose JSON / meta / backup file I/O
-  tool.py        : pose data model, YOLO estimation, all skeleton operations
+  tool.py        : pose data model, YOLO estimation, skeleton operations, magnifier
   main.py        : this file
 """
 import os
@@ -29,7 +31,9 @@ import tool
 # ==========================================
 DEFAULT_MODEL = r".\models\yolo26x-pose.pt"
 HIT_RADIUS = 12       # mouse hit radius for picking a joint (screen pixels)
-CACHE_SIZE = 60       # number of recent display frames kept in memory
+CACHE_SIZE = 60       # recent display frames kept in memory
+RAW_CACHE_SIZE = 8    # recent full-resolution frames kept for the magnifier
+LOUPE_SIZE = 240      # magnifier panel edge length (screen pixels)
 PERSON_COLORS = ["#00ff00", "#ff8c00", "#ff00ff", "#00c8ff", "#ffff00"]   # limb color per person_i
 
 
@@ -44,13 +48,17 @@ class PoseEditorApp:
         self.mode = tk.StringVar(value="video")
         self.show_var = tk.BooleanVar(value=True)
         self.names_var = tk.BooleanVar(value=True)
+        self.mag_var = tk.BooleanVar(value=True)
         self.jump_var = tk.StringVar()
         self.font = ("Segoe UI", 9, "bold")
 
         self.src, self.src_path = None, None        # file_reader.FrameSource
         self.doc, self.json_path = None, None       # tool.PoseDoc
         self.k, self.img_w, self.img_h, self.scale = 0, 0, 0, 1.0
-        self.cache, self.photo = OrderedDict(), None
+        self.cache, self.raw_cache = OrderedDict(), OrderedDict()
+        self.photo, self.loupe_photo = None, None
+        self.mag = tool.Magnifier(size=LOUPE_SIZE, zoom=4)
+        self.mouse = None                           # last cursor position on the canvas
         self.sel, self.hint = None, ""
         self.model_path = DEFAULT_MODEL
         self.worker, self.q, self.stop_evt = None, queue.Queue(), threading.Event()
@@ -58,6 +66,7 @@ class PoseEditorApp:
         self._build_ui()
         self._update_title()
         self.update_status()
+        self.update_loupe()
 
     # ==========================================
     # UI layout
@@ -92,6 +101,8 @@ class PoseEditorApp:
                         command=self.redraw_pose).pack(side="left")
         ttk.Checkbutton(r2, text="Joint Names", variable=self.names_var,
                         command=self.redraw_pose).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(r2, text="Magnifier (M)", variable=self.mag_var,
+                        command=self.update_loupe).pack(side="left", padx=(6, 0))
         ttk.Separator(r2, orient="vertical").pack(side="left", fill="y", padx=8)
         self.btn_add = ttk.Button(r2, text="Add Skeleton", command=self.add_skeleton)
         self.btn_del = ttk.Button(r2, text="Delete Skeleton", command=self.delete_skeleton)
@@ -101,13 +112,27 @@ class PoseEditorApp:
         self.lock_widgets = [self.rb_video, self.rb_folder, self.btn_src, self.btn_json,
                              self.btn_save, self.btn_add, self.btn_del, self.btn_main]
 
-        self.canvas = tk.Canvas(self.root, bg="black", highlightthickness=0, width=960, height=540)
-        self.canvas.pack(padx=6)
+        # Image canvas in the middle; magnifier panel to its right, aligned to the image bottom
+        view = ttk.Frame(self.root)
+        view.pack(fill="x", padx=6)
+        view.columnconfigure(0, weight=1)                                # left spacer
+        view.columnconfigure(2, weight=1, minsize=LOUPE_SIZE + 12)       # keeps space when hidden
+        self.canvas = tk.Canvas(view, bg="black", highlightthickness=0, width=960, height=540)
+        self.canvas.grid(row=0, column=1, sticky="n")
+        self.loupe = tk.Canvas(view, width=LOUPE_SIZE, height=LOUPE_SIZE, bg="#282828",
+                               highlightthickness=0)
+        self.loupe.grid(row=0, column=2, sticky="sw", padx=(8, 0))
+
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
         self.canvas.bind("<Button-3>", self.on_right)
         self.canvas.bind("<Motion>", self.on_hover)
+        self.canvas.bind("<Leave>", self.on_leave)
+        for cv in (self.canvas, self.loupe):
+            cv.bind("<MouseWheel>", self.on_wheel)             # Windows / macOS
+            cv.bind("<Button-4>", self.on_wheel)               # Linux wheel up
+            cv.bind("<Button-5>", self.on_wheel)               # Linux wheel down
 
         bottom = ttk.Frame(self.root, padding=(6, 2, 6, 6))
         bottom.pack(fill="x")
@@ -115,18 +140,19 @@ class PoseEditorApp:
         self.status.pack(side="left", fill="x", expand=True)
         self.prog = ttk.Progressbar(bottom, length=220, mode="determinate")   # shown only while estimating
 
-        self.root.bind("<Left>", self._nav(-1))
-        self.root.bind("<Right>", self._nav(1))
+        self.root.bind("<Left>", self._key(lambda: self.step(-1)))
+        self.root.bind("<Right>", self._key(lambda: self.step(1)))
+        self.root.bind("<Key-m>", self._key(self.toggle_magnifier))
         self.root.bind("<Control-s>", lambda e: self.save())
         self.root.bind("<Control-z>", lambda e: self.undo_last())
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
-        self.max_w = int(self.root.winfo_screenwidth() * 0.85)
+        self.max_w = int(self.root.winfo_screenwidth() * 0.85) - LOUPE_SIZE - 20
         self.max_h = int(self.root.winfo_screenheight() * 0.68)
 
-    def _nav(self, d):
+    def _key(self, action):
         def handler(e):
-            if not isinstance(e.widget, tk.Entry):         # arrow keys inside the entry box don't change frames
-                self.step(d)
+            if not isinstance(e.widget, tk.Entry):         # keys typed into the entry box are ignored
+                action()
         return handler
 
     # ==========================================
@@ -232,7 +258,8 @@ class PoseEditorApp:
         self.img_h, self.img_w = first.shape[:2]
         self.scale = min(self.max_w / self.img_w, self.max_h / self.img_h, 1.0)
         self.canvas.config(width=round(self.img_w * self.scale), height=round(self.img_h * self.scale))
-        self.cache = OrderedDict({1: self._to_display(first)})
+        self.cache, self.raw_cache = OrderedDict(), OrderedDict()
+        self._store_frame(1, first)
         if src.bad:
             messagebox.showwarning(
                 "Frame numbering",
@@ -274,13 +301,24 @@ class PoseEditorApp:
         return True
 
     # ==========================================
-    # Display
+    # Frame cache and display
     # ==========================================
-    def _to_display(self, img):
-        if self.scale != 1.0:
-            img = cv2.resize(img, (round(self.img_w * self.scale), round(self.img_h * self.scale)),
-                             interpolation=cv2.INTER_AREA)
-        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    @staticmethod
+    def _put(cache, k, value, limit):
+        cache[k] = value
+        cache.move_to_end(k)
+        while len(cache) > limit:
+            cache.popitem(last=False)
+
+    def _store_frame(self, k, bgr):
+        """Cache frame k: display-size RGB for the canvas, full-resolution RGB for the magnifier."""
+        full = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        disp = full if self.scale == 1.0 else cv2.resize(
+            full, (round(self.img_w * self.scale), round(self.img_h * self.scale)),
+            interpolation=cv2.INTER_AREA)
+        self._put(self.cache, k, disp, CACHE_SIZE)
+        self._put(self.raw_cache, k, full, RAW_CACHE_SIZE)
+        return disp
 
     def show_frame(self, k):
         if self.src is None:
@@ -290,9 +328,7 @@ class PoseEditorApp:
             img = self.src.get(k)
             if img is None:
                 return False
-            rgb = self.cache[k] = self._to_display(img)
-            if len(self.cache) > CACHE_SIZE:
-                self.cache.popitem(last=False)
+            rgb = self._store_frame(k, img)
         else:
             self.cache.move_to_end(k)
         if self.doc is not None and self.doc.dragging:
@@ -310,10 +346,10 @@ class PoseEditorApp:
         self.redraw_pose()
         return True
 
-    def _text(self, x, y, text, color, anchor="w"):
+    def _text(self, x, y, text, color, anchor="w", tags="pose"):
         for dx, fill in ((1, "black"), (0, color)):          # black shadow keeps text readable
             self.canvas.create_text(x + dx, y + dx, text=text, fill=fill, anchor=anchor,
-                                    font=self.font, tags="pose")
+                                    font=self.font, tags=tags)
 
     def redraw_pose(self):
         """Filled dot = reliable joint; hollow dot + dashed limb = unreliable or not yet placed."""
@@ -349,6 +385,67 @@ class PoseEditorApp:
                     bc = p.get("box_conf")
                     self._text(x, y - 20, pk + (f" {bc:.2f}" if bc is not None else ""), col, anchor="s")
         self.update_status()
+        self.update_loupe()
+
+    # ==========================================
+    # Magnifier
+    # ==========================================
+        # ==========================================
+    # Magnifier (fixed panel at the bottom-right of the image)
+    # ==========================================
+    def toggle_magnifier(self):
+        self.mag_var.set(not self.mag_var.get())
+        self.update_loupe()
+
+    def _loupe_source(self):
+        """Prefer the full-resolution frame; fall back to the display image if it was evicted."""
+        raw = self.raw_cache.get(self.k)
+        if raw is not None:
+            return raw, 1.0
+        return self.cache.get(self.k), self.scale
+
+    def _loupe_text(self, x, y, text, anchor="nw"):
+        for dx, fill in ((1, "black"), (0, "white")):        # black shadow keeps text readable
+            self.loupe.create_text(x + dx, y + dx, text=text, fill=fill, anchor=anchor,
+                                   justify="center", font=self.font)
+
+    def update_loupe(self):
+        if not self.mag_var.get():
+            self.loupe.grid_remove()                         # column minsize keeps the layout still
+            return
+        self.loupe.grid()
+        lp, size = self.loupe, self.mag.size
+        lp.delete("all")
+
+        img = None
+        if self.src is not None and self.k and self.mouse:
+            img, img_scale = self._loupe_source()
+        if img is None:
+            self._loupe_text(size / 2, size / 2, "Magnifier\nmove the mouse over the image", anchor="center")
+        else:
+            if self.doc is not None and self.doc.dragging:
+                cx, cy = self.doc.drag_point()               # centre on the joint being dragged
+            else:
+                cx, cy = self.mouse[0] / self.scale, self.mouse[1] / self.scale
+            fd = self.doc.frame(self.k) if (self.doc and self.show_var.get()) else None
+            out = self.mag.render(img, img_scale, cx, cy, fd=fd, sel=self.sel,
+                                  person_colors=PERSON_COLORS, joint_color=side_color)
+            self.loupe_photo = ImageTk.PhotoImage(Image.fromarray(out))
+            lp.create_image(0, 0, anchor="nw", image=self.loupe_photo)
+            self._loupe_text(6, 6, f"x {cx:.1f}   y {cy:.1f}")
+        self._loupe_text(6, size - 6, f"×{self.mag.zoom}", anchor="sw")
+        lp.create_rectangle(1, 1, size - 1, size - 1, outline="#808080", width=2)
+
+    def on_wheel(self, e):
+        if not self.mag_var.get():
+            return
+        self.mag.step_zoom(1 if (e.num == 4 or getattr(e, "delta", 0) > 0) else -1)
+        self.update_loupe()
+
+    def on_leave(self, e):
+        if not (self.doc and self.doc.dragging):
+            self.mouse = None
+            self.update_loupe()
 
     # ==========================================
     # Navigation
@@ -389,11 +486,14 @@ class PoseEditorApp:
                                  HIT_RADIUS / self.scale, prefer=self.sel)
 
     def on_hover(self, e):
+        self.mouse = (e.x, e.y)
         hit = self._hit(e) if not (self.doc and self.doc.dragging) else None
         self.canvas.config(cursor="fleur" if hit else "")
+        self.update_loupe()
 
     def on_press(self, e):
         self.canvas.focus_set()
+        self.mouse = (e.x, e.y)
         if not self.editable():
             return
         hit = self._hit(e)
@@ -407,7 +507,9 @@ class PoseEditorApp:
         self.redraw_pose()
 
     def on_drag(self, e):
+        self.mouse = (e.x, e.y)
         if not (self.doc and self.doc.dragging):
+            self.update_loupe()
             return
         self.doc.drag_to(e.x / self.scale, e.y / self.scale, self.img_w, self.img_h)
         self._update_title()
@@ -416,6 +518,7 @@ class PoseEditorApp:
     def on_release(self, e):
         if self.doc:
             self.doc.end_drag()
+        self.update_loupe()
 
     def on_right(self, e):
         hit = self._hit(e)

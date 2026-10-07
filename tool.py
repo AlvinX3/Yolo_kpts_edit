@@ -10,7 +10,11 @@ No UI code here. All coordinates are in original-image pixels.
 import copy
 import math
 
+import cv2
+import numpy as np
+
 from file_reader import idx_of, person_keys, ordered_pose
+
 
 # ==========================================
 # Skeleton definition and thresholds
@@ -211,7 +215,7 @@ class PoseDoc:
     def begin_drag(self, k, pk, j):
         self._snapshot(k)
         self._drag = [k, pk, j, False]
-
+    
     def drag_to(self, x, y, img_w, img_h):
         """Move the dragged joint to (x, y), clamped to the image. A hand-placed joint gets Confidence 1.0."""
         if not self._drag:
@@ -224,6 +228,14 @@ class PoseDoc:
         if not moved:
             self._drag[3] = True
             self._touch(k)
+    
+    def drag_point(self):
+        """Current (x, y) of the joint being dragged, or None. Used to centre the magnifier."""
+        if not self._drag:
+            return None
+        k, pk, j, _ = self._drag
+        bp = self.frame(k)[pk]["keypoints"][f"bonepoint_{j}"]
+        return bp["x"], bp["y"]
 
     def end_drag(self):
         """Finish dragging. A click without movement is not recorded as an edit."""
@@ -284,3 +296,126 @@ class PoseDoc:
 
     def mark_saved(self):
         self.dirty = False
+
+# ==========================================
+# Magnifier (loupe)
+# ==========================================
+_SHIFT = 4                     # sub-pixel precision for OpenCV drawing (1/16 px)
+_F = 1 << _SHIFT
+
+
+def hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+class Magnifier:
+    """Loupe for precise joint placement.
+
+    Crops a square region around a point of the frame, enlarges it, and draws the skeleton
+    and a crosshair on it. Pure numpy / OpenCV; the caller only has to display the result.
+
+    Coordinates are original-image pixels in the same convention as the pose JSON and the
+    main canvas (pixel i covers [i, i+1)). The source image may be the full-resolution frame
+    (img_scale = 1.0) or a downscaled display image (img_scale < 1.0)."""
+
+    ZOOM_LEVELS = (2, 3, 4, 6, 8, 12)      # loupe pixels per original-image pixel
+
+    def __init__(self, size=240, zoom=4):
+        self.size = size
+        self.zoom = zoom
+        self.cx = self.cy = 0.0
+
+    # ----- zoom -----
+    def step_zoom(self, d):
+        """d = +1 zoom in one level, -1 zoom out one level."""
+        lv = self.ZOOM_LEVELS
+        i = min(range(len(lv)), key=lambda n: abs(lv[n] - self.zoom))
+        self.zoom = lv[max(0, min(len(lv) - 1, i + d))]
+
+    # ----- coordinate mapping -----
+    def to_loupe(self, x, y):
+        """Original-image point -> loupe point (continuous coordinates)."""
+        return (self.size / 2 + (x - self.cx) * self.zoom,
+                self.size / 2 + (y - self.cy) * self.zoom)
+
+    def to_image(self, u, v):
+        """Loupe point -> original-image point."""
+        return (self.cx + (u - self.size / 2) / self.zoom,
+                self.cy + (v - self.size / 2) / self.zoom)
+
+    @staticmethod
+    def _fix(p):
+        """Continuous loupe point -> OpenCV fixed-point pixel coordinates (pixel centres at integers)."""
+        return int(round((p[0] - 0.5) * _F)), int(round((p[1] - 0.5) * _F))
+
+    # ----- rendering -----
+    def render(self, img, img_scale, cx, cy, fd=None, sel=None,
+               person_colors=("#00ff00",), joint_color=None):
+        """Return a (size x size) RGB image centred on original-image point (cx, cy).
+        img           : RGB frame
+        img_scale     : img pixels per original-image pixel (1.0 for a full-resolution frame)
+        fd            : frame data from the pose JSON (None = image only)
+        sel           : selected person key (drawn thicker)
+        person_colors : limb color (hex) per person_i
+        joint_color   : function j -> hex color for joint j (None = white)"""
+        self.cx, self.cy = cx, cy
+        f = img_scale
+        a = f / self.zoom                                     # src pixels per loupe pixel
+        bx = f * cx + f * (0.5 - self.size / 2) / self.zoom - 0.5
+        by = f * cy + f * (0.5 - self.size / 2) / self.zoom - 0.5
+        m = np.float32([[a, 0, bx], [0, a, by]])
+        interp = cv2.INTER_NEAREST if self.zoom / f >= 3 else cv2.INTER_LINEAR   # crisp pixels at high zoom
+        out = cv2.warpAffine(img, m, (self.size, self.size), flags=interp | cv2.WARP_INVERSE_MAP,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=(40, 40, 40))
+        if fd:
+            self._draw_pose(out, fd, sel, person_colors, joint_color)
+        self._draw_crosshair(out)
+        return out
+
+    def _line(self, out, p, q, col, th, dashed):
+        if not dashed:
+            cv2.line(out, self._fix(p), self._fix(q), col, th, cv2.LINE_AA, _SHIFT)
+            return
+        ok, p1, p2 = cv2.clipLine((0, 0, self.size, self.size),
+                                  (int(round(p[0])), int(round(p[1]))),
+                                  (int(round(q[0])), int(round(q[1]))))
+        if not ok:
+            return
+        (x1, y1), (x2, y2) = p1, p2
+        length = math.hypot(x2 - x1, y2 - y1)
+        if length < 1:
+            return
+        for s in range(0, int(length), 8):                    # 5 px dash, 3 px gap
+            t0, t1 = s / length, min(s + 5, length) / length
+            a = (x1 + (x2 - x1) * t0, y1 + (y2 - y1) * t0)
+            b = (x1 + (x2 - x1) * t1, y1 + (y2 - y1) * t1)
+            cv2.line(out, self._fix(a), self._fix(b), col, th, cv2.LINE_AA, _SHIFT)
+
+    def _draw_pose(self, out, fd, sel, person_colors, joint_color):
+        for pi, pk in enumerate(person_keys(fd)):
+            kp = fd[pk]["keypoints"]
+            col = hex_to_rgb(person_colors[pi % len(person_colors)])
+            is_sel = pk == sel
+            pts, vis = {}, {}
+            for j in range(NUM_KPTS):
+                bp = kp.get(f"bonepoint_{j}")
+                if bp:
+                    pts[j] = self.to_loupe(bp["x"], bp["y"])
+                    vis[j] = is_visible(bp)
+            for a, b in COCO_SKELETON:
+                if a in pts and b in pts:
+                    self._line(out, pts[a], pts[b], col, 2 if is_sel else 1, not (vis[a] and vis[b]))
+            # Joints are hollow rings so the pixels under the joint stay visible
+            r = (7 if is_sel else 6) * _F
+            for j, p in pts.items():
+                jc = hex_to_rgb(joint_color(j)) if joint_color else (255, 255, 255)
+                cv2.circle(out, self._fix(p), r, (0, 0, 0), 4 if vis[j] else 3, cv2.LINE_AA, _SHIFT)
+                cv2.circle(out, self._fix(p), r, jc, 2 if vis[j] else 1, cv2.LINE_AA, _SHIFT)
+
+    def _draw_crosshair(self, out):
+        c = self.size / 2
+        for p, q in (((c - 18, c), (c - 6, c)), ((c + 6, c), (c + 18, c)),
+                     ((c, c - 18), (c, c - 6)), ((c, c + 6), (c, c + 18))):
+            cv2.line(out, self._fix(p), self._fix(q), (0, 0, 0), 3, cv2.LINE_AA, _SHIFT)
+            cv2.line(out, self._fix(p), self._fix(q), (255, 255, 255), 1, cv2.LINE_AA, _SHIFT)
