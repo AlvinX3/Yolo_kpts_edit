@@ -54,6 +54,7 @@ class PoseEditorApp:
 
         self.src, self.src_path = None, None        # file_reader.FrameSource
         self.doc, self.json_path = None, None       # tool.PoseDoc
+        self.own_file = False                       # True only for a JSON created by Save As in this session
         self.k, self.img_w, self.img_h, self.scale = 0, 0, 0, 1.0
         self.cache, self.raw_cache = OrderedDict(), OrderedDict()
         self.photo, self.loupe_photo = None, None
@@ -80,9 +81,10 @@ class PoseEditorApp:
         self.btn_json = ttk.Button(r1, text="Open Pose JSON", command=self.open_json)
         self.btn_est = ttk.Button(r1, text="Estimate", command=self.toggle_estimate)
         self.btn_save = ttk.Button(r1, text="Save", command=self.save)
+        self.btn_save_as = ttk.Button(r1, text="Save as", command=self.save_as)
         self.rb_video.pack(side="left")
         self.rb_folder.pack(side="left", padx=(0, 10))
-        for b in (self.btn_src, self.btn_json, self.btn_est, self.btn_save):
+        for b in (self.btn_src, self.btn_json, self.btn_est, self.btn_save, self.btn_save_as):
             b.pack(side="left", padx=2)
         ttk.Button(r1, text="Exit", command=self.quit).pack(side="right")
 
@@ -109,8 +111,9 @@ class PoseEditorApp:
         self.btn_main = ttk.Button(r2, text="Set as person_0", command=self.set_main)
         for b in (self.btn_add, self.btn_del, self.btn_main):
             b.pack(side="left", padx=2)
+
         self.lock_widgets = [self.rb_video, self.rb_folder, self.btn_src, self.btn_json,
-                             self.btn_save, self.btn_add, self.btn_del, self.btn_main]
+                             self.btn_save, self.btn_save_as, self.btn_add, self.btn_del, self.btn_main]
 
         # Image canvas in the middle; magnifier panel to its right, aligned to the image bottom
         view = ttk.Frame(self.root)
@@ -145,6 +148,8 @@ class PoseEditorApp:
         self.root.bind("<Key-m>", self._key(self.toggle_magnifier))
         self.root.bind("<Control-s>", lambda e: self.save())
         self.root.bind("<Control-z>", lambda e: self.undo_last())
+        self.root.bind("<Control-s>", lambda e: self.save())
+        self.root.bind("<Control-Shift-S>", lambda e: self.save_as())
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.max_w = int(self.root.winfo_screenwidth() * 0.85) - LOUPE_SIZE - 20
         self.max_h = int(self.root.winfo_screenheight() * 0.68)
@@ -185,8 +190,10 @@ class PoseEditorApp:
 
     def _update_title(self):
         name = os.path.basename(os.path.normpath(self.src_path)) if self.src_path else ""
+        jname = os.path.basename(self.json_path) if self.json_path else ""
         dirty = self.doc is not None and self.doc.dirty
-        self.root.title("Pose Annotation Tool" + (f" - {name}" if name else "") + (" *" if dirty else ""))
+        self.root.title("Pose Annotation Tool" + (f" - {name}" if name else "")
+                        + (f" [{jname}]" if jname else "") + (" *" if dirty else ""))
 
     def update_status(self):
         if self.src is None:
@@ -224,8 +231,6 @@ class PoseEditorApp:
                                         parent=self.root)
         if ans is None:
             return False
-        if ans:
-            self.save()
         return True
 
     def open_source(self):
@@ -254,6 +259,7 @@ class PoseEditorApp:
             self.src.close()
         self.src, self.src_path = src, path
         self.doc = self.json_path = self.sel = None
+        self.own_file = False
         self.k = 0
         self.img_h, self.img_w = first.shape[:2]
         self.scale = min(self.max_w / self.img_w, self.max_h / self.img_h, 1.0)
@@ -292,6 +298,7 @@ class PoseEditorApp:
             messagebox.showerror("Failed to load pose JSON", f"{jp}\n{e}", parent=self.root)
             return False
         self.doc, self.json_path, self.sel = tool.PoseDoc(pose, edits), jp, None
+        self.own_file = False
         if self.src.total and len(pose) != self.src.total:
             messagebox.showwarning("Frame count mismatch",
                                    f"The pose JSON has {len(pose)} frames but the source has {self.src.total}. "
@@ -574,20 +581,56 @@ class PoseEditorApp:
     # Flow: save
     # ==========================================
     def save(self):
+        """Ctrl+S. Older files are never overwritten: unless the current JSON was created by
+        Save As in this session, this falls through to Save As. Returns True if saved."""
         if self.busy() or self.doc is None:
-            return
+            return False
+        if not self.own_file:
+            return self.save_as()
+        return self._write(self.json_path, new_file=False)
+
+    def save_as(self):
+        """Always write to a new file; an existing name is refused, never overwritten."""
+        if self.busy() or self.doc is None:
+            return False
+        suggest = file_reader.unique_json_path(self.json_path)
+        while True:
+            path = filedialog.asksaveasfilename(
+                title="Save pose JSON as (new file)", parent=self.root,
+                initialdir=os.path.dirname(suggest), initialfile=os.path.basename(suggest),
+                defaultextension=".json", filetypes=[("Pose JSON", "*.json")],
+                confirmoverwrite=False)
+            if not path:
+                return False
+            path = os.path.normpath(path)
+            if not file_reader._taken(path):
+                break
+            messagebox.showwarning(
+                "File exists",
+                f"{path}\n(or its _meta / _yolo file) already exists.\n"
+                "Existing files are never overwritten; please choose another name.",
+                parent=self.root)
+            suggest = file_reader.unique_json_path(path)
+        return self._write(path, new_file=True)
+
+    def _write(self, path, new_file):
+        old = self.json_path
         self.doc.prepare_save()
         try:
-            backup = file_reader.save_pose(self.json_path, self.doc.pose, self.doc.edited)
-        except OSError as e:
+            if new_file:
+                file_reader.save_pose_as(path, old, self.doc.pose, self.doc.edited)
+            else:
+                file_reader.save_pose(path, self.doc.pose, self.doc.edited)
+        except OSError as e:                       # includes FileExistsError
             messagebox.showerror("Save failed", str(e), parent=self.root)
-            return
+            return False
+        self.json_path, self.own_file = path, True
         self.doc.mark_saved()
         self._update_title()
-        self.hint = (f"Saved {os.path.basename(self.json_path)} "
-                     f"(raw YOLO output kept in {os.path.basename(backup)})")
+        self.hint = f"Saved {os.path.basename(path)}" + (
+            f" ({os.path.basename(old)} left untouched)" if new_file else "")
         self.update_status()
-
+        return True
     # ==========================================
     # Flow: YOLO estimation (background thread)
     # ==========================================
@@ -601,12 +644,14 @@ class PoseEditorApp:
             return
         if not self.confirm_discard():
             return
-        jp = file_reader.default_json_path(self.src_path, self.src.mode)
+
+        jp = file_reader.unique_json_path(file_reader.default_json_path(self.src_path, self.src.mode))
         if os.path.exists(jp) and not messagebox.askyesno(
                 "Overwrite?",
                 f"{jp}\nalready exists. Re-estimating will overwrite it and discard manual edits. Continue?",
                 parent=self.root):
             return
+        
         if not os.path.isfile(self.model_path):
             mp = filedialog.askopenfilename(title="Select a YOLO pose model",
                                             filetypes=[("PyTorch model", "*.pt")])
@@ -670,6 +715,7 @@ class PoseEditorApp:
                     _, jp, pose, stats = msg
                     self._finish_estimate()
                     self.doc, self.json_path, self.sel = tool.PoseDoc(pose), jp, None
+                    self.own_file = False
                     self._update_title()
                     self.show_frame(1)
                     messagebox.showinfo(

@@ -177,21 +177,56 @@ def load_pose(json_path):
     return pose, read_meta(json_path).get("manual_edits", [])
 
 
+def _taken(path):
+    """True if this pose JSON name is already used (the JSON itself, its meta or its backup)."""
+    return any(os.path.exists(p) for p in (path, meta_path(path), backup_path(path)))
+
+
+def unique_json_path(json_path):
+    """json_path if its name is free, else the first free name_v2_bp.json, name_v3_bp.json, ...
+    Keeps the *_bp.json suffix so find_json still recognizes the file."""
+    if not _taken(json_path):
+        return json_path
+    root, ext = os.path.splitext(json_path)
+    suffix = "_bp" if root.endswith("_bp") else ""
+    stem = re.sub(r"_v\d+$", "", root[:len(root) - len(suffix)])
+    n = 2
+    while _taken(f"{stem}_v{n}{suffix}{ext}"):
+        n += 1
+    return f"{stem}_v{n}{suffix}{ext}"
+
+
 def save_pose(json_path, pose, manual_edits):
-    """Save an edited pose. The first save keeps the original file as *_yolo.json.
-    Returns the backup path."""
-    backup = backup_path(json_path)
-    if os.path.exists(json_path) and not os.path.exists(backup):
-        shutil.copy2(json_path, backup)
+    """Overwrite json_path with the edited pose.
+    Only used for a file created by save_pose_as in the current session, never for an older file."""
     _write_json_atomic(json_path, pose, 4)
     write_meta(json_path, {"n_frames": len(pose),
                            "manual_edits": sorted(manual_edits, key=idx_of)})
-    return backup
+
+
+def save_pose_as(new_path, old_path, pose, manual_edits):
+    """Save the edited pose to a NEW file; old_path is left untouched.
+    Raises FileExistsError if new_path (or its meta / backup) already exists.
+    The raw YOLO output and the meta info of old_path are carried over to the new file."""
+    if _taken(new_path):
+        raise FileExistsError(f"{new_path} (or its _meta / _yolo file) already exists")
+    raw = None
+    if old_path:
+        old_backup = backup_path(old_path)
+        raw = old_backup if os.path.isfile(old_backup) else (old_path if os.path.isfile(old_path) else None)
+    if raw:
+        shutil.copy2(raw, backup_path(new_path))
+    meta = read_meta(old_path) if old_path else {}
+    meta.update({"n_frames": len(pose),
+                 "manual_edits": sorted(manual_edits, key=idx_of),
+                 "saved_from": os.path.abspath(old_path) if old_path else None})
+    _write_json_atomic(new_path, pose, 4)
+    _write_json_atomic(meta_path(new_path), meta, 2)
 
 
 def save_estimation(json_path, pose, meta):
-    """Save a fresh YOLO result: overwrite the pose JSON, refresh the *_yolo.json backup,
-    and replace the meta file (old manual_edits no longer apply)."""
+    """Save a fresh YOLO result. The caller passes a free name from unique_json_path,
+    so nothing existing is overwritten."""
     _write_json_atomic(json_path, pose, 4)
     shutil.copy2(json_path, backup_path(json_path))
     write_meta(json_path, meta, merge=False)
