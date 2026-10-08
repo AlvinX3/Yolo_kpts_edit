@@ -5,6 +5,8 @@ Workflow: choose "Video / Folder" -> Open Source -> Open Pose JSON (or "Estimate
           -> review frame by frame -> drag joints / add skeletons -> Save
 Mouse:    left-drag a joint | right-click a joint = toggle visible / invisible
           mouse wheel = magnifier zoom
+          double-click a joint = type its Confidence | mouse wheel = magnifier zoom
+
 Keys:     Left / Right = previous / next frame | M = magnifier on / off
           Ctrl+S = save | Ctrl+Z = undo
 
@@ -18,7 +20,7 @@ import queue
 import threading
 from collections import OrderedDict
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 import cv2
 from PIL import Image, ImageTk
@@ -132,6 +134,7 @@ class PoseEditorApp:
         self.canvas.bind("<Button-3>", self.on_right)
         self.canvas.bind("<Motion>", self.on_hover)
         self.canvas.bind("<Leave>", self.on_leave)
+        self.canvas.bind("<Double-Button-1>", self.on_double)
         for cv in (self.canvas, self.loupe):
             cv.bind("<MouseWheel>", self.on_wheel)             # Windows / macOS
             cv.bind("<Button-4>", self.on_wheel)               # Linux wheel up
@@ -535,6 +538,32 @@ class PoseEditorApp:
         self.sel = hit[0]
         self._update_title()
         self.redraw_pose()
+
+    def on_double(self, e):
+        """Double-click a joint: type its Confidence (0 - 1)."""
+        hit = self._hit(e)
+        if hit is None:
+            return
+        if self.doc.dragging:
+            self.doc.end_drag()
+        pk, j = hit
+        bp = self.doc.frame(self.k)[pk]["keypoints"][f"bonepoint_{j}"]
+        self.sel = pk
+        self.redraw_pose()
+        val = simpledialog.askfloat(
+            "Set Confidence",
+            f"{pk}  {tool.KPT_NAMES[j]}\n"
+            f"Confidence (0 - 1, > {tool.CONF_TH} = reliable):",
+            initialvalue=bp.get("Confidence", 0.0),
+            minvalue=0.0, maxvalue=1.0, parent=self.root)
+        self.canvas.focus_set()
+        if val is None:                      # cancelled
+            return
+        if self.doc.set_confidence(self.k, pk, j, val):
+            self._update_title()
+            self.hint = f"{pk} {tool.KPT_NAMES[j]} Confidence = {val:.4g}"
+        self.redraw_pose()
+    
 
     # ==========================================
     # Buttons -> tool operations

@@ -251,6 +251,18 @@ class PoseDoc:
         bp["Confidence"] = 0.0 if is_visible(bp) else 1.0
         self._touch(k)
 
+    def set_confidence(self, k, pk, j, value):
+        """Set a joint's Confidence to `value` (clamped to 0.0 - 1.0).
+        Returns False if the value did not change (no undo step, not marked as edited)."""
+        bp = self.frame(k)[pk]["keypoints"][f"bonepoint_{j}"]
+        value = round(min(max(float(value), 0.0), 1.0), 4)
+        if bp.get("Confidence") == value:
+            return False
+        self._snapshot(k)
+        bp["Confidence"] = value
+        self._touch(k)
+        return True
+
     def add_skeleton(self, k, img_w, img_h):
         """Add a template skeleton in the image center. All joints start at Confidence 0.0
         (= not placed yet) and become 1.0 once dragged. Returns the new person key."""
