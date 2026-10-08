@@ -29,6 +29,9 @@ COCO_SKELETON = [
 KPT_NAMES = ["nose", "L eye", "R eye", "L ear", "R ear", "L shoulder", "R shoulder",
              "L elbow", "R elbow", "L wrist", "R wrist", "L hip", "R hip",
              "L knee", "R knee", "L ankle", "R ankle"]
+
+LR_MIRROR = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
+
 # Standing template for add_skeleton (x, y): height = 1, top of head at y = 0.
 # The person faces the camera, so their LEFT side appears on the RIGHT of the image.
 TEMPLATE = [(0, .08), (.03, .06), (-.03, .06), (.06, .08), (-.06, .08),
@@ -291,6 +294,17 @@ class PoseDoc:
             self._reorder(fd, [pk] + [p for p in person_keys(fd) if p != pk])
             self._touch(k)
         return "person_0"
+
+    def swap_lr(self, k, pk):
+        """Swap the left and right joints of person `pk` (YOLO often mirrors them).
+        Coordinates and Confidence move together; key order stays bonepoint_0..16."""
+        self._snapshot(k)
+        kp = self.frame(k)[pk]["keypoints"]
+        swapped = {f"bonepoint_{j}": kp[f"bonepoint_{m}"]
+                   for j, m in enumerate(LR_MIRROR) if f"bonepoint_{m}" in kp}
+        kp.clear()
+        kp.update(swapped)
+        self._touch(k)
 
     @staticmethod
     def _reorder(fd, order):

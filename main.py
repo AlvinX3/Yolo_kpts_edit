@@ -7,8 +7,8 @@ Mouse:    left-drag a joint | right-click a joint = toggle visible / invisible
           mouse wheel = magnifier zoom
           double-click a joint = type its Confidence | mouse wheel = magnifier zoom
 
-Keys:     Left / Right = previous / next frame | M = magnifier on / off
-          Ctrl+S = save | Ctrl+Z = undo
+Keys:     Left / Right = previous / next frame | M = magnifier on / off | F = swap L/R
+          Ctrl+S = save | Ctrl+Shift+S = save as | Ctrl+Z = undo
 
 Modules:
   file_reader.py : frame sources, pose JSON / meta / backup file I/O
@@ -75,6 +75,7 @@ class PoseEditorApp:
     # UI layout
     # ==========================================
     def _build_ui(self):
+        # ----- row 1: source / file buttons -----
         r1 = ttk.Frame(self.root, padding=(6, 6, 6, 0))
         r1.pack(fill="x")
         self.rb_video = ttk.Radiobutton(r1, text="Video", value="video", variable=self.mode)
@@ -83,13 +84,14 @@ class PoseEditorApp:
         self.btn_json = ttk.Button(r1, text="Open Pose JSON", command=self.open_json)
         self.btn_est = ttk.Button(r1, text="Estimate", command=self.toggle_estimate)
         self.btn_save = ttk.Button(r1, text="Save", command=self.save)
-        self.btn_save_as = ttk.Button(r1, text="Save as", command=self.save_as)
+        self.btn_save_as = ttk.Button(r1, text="Save As...", command=self.save_as)
         self.rb_video.pack(side="left")
         self.rb_folder.pack(side="left", padx=(0, 10))
         for b in (self.btn_src, self.btn_json, self.btn_est, self.btn_save, self.btn_save_as):
             b.pack(side="left", padx=2)
         ttk.Button(r1, text="Exit", command=self.quit).pack(side="right")
 
+        # ----- row 2: navigation / display / skeleton editing -----
         r2 = ttk.Frame(self.root, padding=(6, 4))
         r2.pack(fill="x")
         ttk.Button(r2, text="◀ Prev", command=lambda: self.step(-1)).pack(side="left", padx=2)
@@ -111,13 +113,16 @@ class PoseEditorApp:
         self.btn_add = ttk.Button(r2, text="Add Skeleton", command=self.add_skeleton)
         self.btn_del = ttk.Button(r2, text="Delete Skeleton", command=self.delete_skeleton)
         self.btn_main = ttk.Button(r2, text="Set as person_0", command=self.set_main)
-        for b in (self.btn_add, self.btn_del, self.btn_main):
+        self.btn_swap = ttk.Button(r2, text="Swap L/R (F)", command=self.swap_lr)
+        for b in (self.btn_add, self.btn_del, self.btn_main, self.btn_swap):
             b.pack(side="left", padx=2)
 
+        # Widgets disabled while YOLO is running
         self.lock_widgets = [self.rb_video, self.rb_folder, self.btn_src, self.btn_json,
-                             self.btn_save, self.btn_save_as, self.btn_add, self.btn_del, self.btn_main]
+                             self.btn_save, self.btn_save_as, self.btn_add, self.btn_del,
+                             self.btn_main, self.btn_swap]
 
-        # Image canvas in the middle; magnifier panel to its right, aligned to the image bottom
+        # ----- image canvas in the middle; magnifier panel to its right -----
         view = ttk.Frame(self.root)
         view.pack(fill="x", padx=6)
         view.columnconfigure(0, weight=1)                                # left spacer
@@ -131,28 +136,30 @@ class PoseEditorApp:
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.canvas.bind("<Double-Button-1>", self.on_double)
         self.canvas.bind("<Button-3>", self.on_right)
         self.canvas.bind("<Motion>", self.on_hover)
         self.canvas.bind("<Leave>", self.on_leave)
-        self.canvas.bind("<Double-Button-1>", self.on_double)
         for cv in (self.canvas, self.loupe):
             cv.bind("<MouseWheel>", self.on_wheel)             # Windows / macOS
             cv.bind("<Button-4>", self.on_wheel)               # Linux wheel up
             cv.bind("<Button-5>", self.on_wheel)               # Linux wheel down
 
+        # ----- status bar -----
         bottom = ttk.Frame(self.root, padding=(6, 2, 6, 6))
         bottom.pack(fill="x")
         self.status = ttk.Label(bottom, anchor="w")
         self.status.pack(side="left", fill="x", expand=True)
         self.prog = ttk.Progressbar(bottom, length=220, mode="determinate")   # shown only while estimating
 
+        # ----- keyboard shortcuts -----
         self.root.bind("<Left>", self._key(lambda: self.step(-1)))
         self.root.bind("<Right>", self._key(lambda: self.step(1)))
         self.root.bind("<Key-m>", self._key(self.toggle_magnifier))
-        self.root.bind("<Control-s>", lambda e: self.save())
-        self.root.bind("<Control-z>", lambda e: self.undo_last())
+        self.root.bind("<Key-f>", self._key(self.swap_lr))
         self.root.bind("<Control-s>", lambda e: self.save())
         self.root.bind("<Control-Shift-S>", lambda e: self.save_as())
+        self.root.bind("<Control-z>", lambda e: self.undo_last())
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         self.max_w = int(self.root.winfo_screenwidth() * 0.85) - LOUPE_SIZE - 20
         self.max_h = int(self.root.winfo_screenheight() * 0.68)
@@ -590,6 +597,14 @@ class PoseEditorApp:
             return
         self.sel = self.doc.set_main(self.k, self.sel)
         self._update_title()
+        self.redraw_pose()
+    
+    def swap_lr(self):
+        if not self._can_edit(need_sel=True):
+            return
+        self.doc.swap_lr(self.k, self.sel)
+        self._update_title()
+        self.hint = f"Swapped left / right of {self.sel} (Ctrl+Z to undo)"
         self.redraw_pose()
 
     def undo_last(self):
