@@ -31,7 +31,7 @@ import tool
 # ==========================================
 # UI settings
 # ==========================================
-DEFAULT_MODEL = r".\models\yolo26x-pose.pt"
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 HIT_RADIUS = 12       # mouse hit radius for picking a joint (screen pixels)
 CACHE_SIZE = 60       # recent display frames kept in memory
 RAW_CACHE_SIZE = 8    # recent full-resolution frames kept for the magnifier
@@ -63,7 +63,7 @@ class PoseEditorApp:
         self.mag = tool.Magnifier(size=LOUPE_SIZE, zoom=4)
         self.mouse = None                           # last cursor position on the canvas
         self.sel, self.hint = None, ""
-        self.model_path = DEFAULT_MODEL
+        self.model_path = None                      # init set none
         self.worker, self.q, self.stop_evt = None, queue.Queue(), threading.Event()
 
         self._build_ui()
@@ -681,9 +681,13 @@ class PoseEditorApp:
                 parent=self.root):
             return
         
-        if not os.path.isfile(self.model_path):
-            mp = filedialog.askopenfilename(title="Select a YOLO pose model",
-                                            filetypes=[("PyTorch model", "*.pt")])
+        if not (self.model_path and os.path.isfile(self.model_path)):
+            self.model_path = file_reader.find_model(MODEL_DIR)
+        if not self.model_path:
+            mp = filedialog.askopenfilename(
+                title="No *.pt found in models folder - select a YOLO pose model",
+                initialdir=MODEL_DIR if os.path.isdir(MODEL_DIR) else os.getcwd(),
+                filetypes=[("PyTorch model", "*.pt")], parent=self.root)
             if not mp:
                 return
             self.model_path = mp
@@ -703,7 +707,7 @@ class PoseEditorApp:
         """Runs in a background thread; talks to the UI only through self.q."""
         q, src = self.q, None
         try:
-            q.put(("msg", "Loading YOLO model..."))
+            q.put(("msg", f"Loading YOLO model {os.path.basename(model_path)}..."))
             src = file_reader.FrameSource(path, mode)        # separate reader from the UI's
             result = tool.estimate_pose(src, model_path,
                                         progress=lambda k, total: q.put(("progress", k, total)),
@@ -749,6 +753,7 @@ class PoseEditorApp:
                     self.show_frame(1)
                     messagebox.showinfo(
                         "Estimation finished",
+                        f"Model: {os.path.basename(self.model_path)}\n"
                         f"Written to {jp}\n{len(pose)} frames | no person: {stats['n_empty']} | "
                         f"person_0 with < {tool.WEAK_TH} reliable joints: {stats['n_weak']}\n"
                         "Use \"Next Suspicious\" to review them one by one.", parent=self.root)

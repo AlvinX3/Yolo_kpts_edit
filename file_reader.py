@@ -120,6 +120,11 @@ def backup_path(json_path):
     """Raw YOLO output backup. Does not match *_bp.json, so it is never auto-loaded."""
     return os.path.splitext(json_path)[0] + "_yolo.json"
 
+def find_model(folder):
+    """First *.pt in `folder` in natural name order (yolo8 < yolo11 < yolo26), or None."""
+    models = glob.glob(os.path.join(folder, "*.pt"))
+    models.sort(key=lambda p: natural_key(os.path.basename(p)))
+    return models[0] if models else None
 
 # ==========================================
 # JSON read / write
