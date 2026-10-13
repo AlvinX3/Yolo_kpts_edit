@@ -109,19 +109,21 @@ class PoseEditorApp:
                         command=self.redraw_pose).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(r2, text="Magnifier (M)", variable=self.mag_var,
                         command=self.update_loupe).pack(side="left", padx=(6, 0))
-        ttk.Separator(r2, orient="vertical").pack(side="left", fill="y", padx=8)
+        
+        self.btn_copy = ttk.Button(r2, text="Copy Previous Frame (C)", command=self.copy_last_frame)
         self.btn_add = ttk.Button(r2, text="Add Skeleton", command=self.add_skeleton)
         self.btn_del = ttk.Button(r2, text="Delete Skeleton", command=self.delete_skeleton)
         self.btn_main = ttk.Button(r2, text="Set as person_0", command=self.set_main)
         self.btn_swap = ttk.Button(r2, text="Swap L/R (F)", command=self.swap_lr)
-        for b in (self.btn_add, self.btn_del, self.btn_main, self.btn_swap):
-            b.pack(side="left", padx=2)
+        for b in (self.btn_copy, self.btn_add, self.btn_del, self.btn_main, self.btn_swap):
+                b.pack(side="left", padx=2)
 
         # Widgets disabled while YOLO is running
         self.lock_widgets = [self.rb_video, self.rb_folder, self.btn_src, self.btn_json,
                              self.btn_save, self.btn_save_as, self.btn_add, self.btn_del,
                              self.btn_main, self.btn_swap]
-
+        
+    
         # ----- image canvas in the middle; magnifier panel to its right -----
         view = ttk.Frame(self.root)
         view.pack(fill="x", padx=6)
@@ -157,6 +159,7 @@ class PoseEditorApp:
         self.root.bind("<Right>", self._key(lambda: self.step(1)))
         self.root.bind("<Key-m>", self._key(self.toggle_magnifier))
         self.root.bind("<Key-f>", self._key(self.swap_lr))
+        self.root.bind("<Key-c>", self._key(self.copy_last_frame))
         self.root.bind("<Control-s>", lambda e: self.save())
         self.root.bind("<Control-Shift-S>", lambda e: self.save_as())
         self.root.bind("<Control-z>", lambda e: self.undo_last())
@@ -575,6 +578,23 @@ class PoseEditorApp:
     # ==========================================
     # Buttons -> tool operations
     # ==========================================
+    def copy_last_frame(self):
+        """Copy every skeleton of the previous frame onto the current frame (Ctrl+Z to undo)."""
+        if not self._can_edit():
+            return
+        if self.k <= 1:
+            self._info("This is the first frame; there is no previous frame to copy.")
+            return
+        n = self.doc.copy_from_prev(self.k)
+        if n is None:
+            self._info(f"frame_{self.k - 1} has no skeleton to copy.")
+            return
+        if self.sel not in (self.doc.frame(self.k) or {}):
+            self.sel = None
+        self._update_title()
+        self.hint = f"Copied {n} skeleton(s) from frame {self.k - 1} (Ctrl+Z to undo)"
+        self.redraw_pose()
+
     def add_skeleton(self):
         if not self._can_edit():
             return

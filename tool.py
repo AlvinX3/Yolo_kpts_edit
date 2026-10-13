@@ -265,7 +265,19 @@ class PoseDoc:
         bp["Confidence"] = value
         self._touch(k)
         return True
-
+    
+    def copy_from_prev(self, k):
+        """Replace frame k with a deep copy of frame k-1 (all persons).
+        Returns the number of persons copied, or None if frame k-1 has nothing to copy.
+        bp_Dis is recomputed by prepare_save() when saving."""
+        prev = self.frame(k - 1)
+        if not prev:
+            return None
+        self._snapshot(k)
+        self.pose[f"frame_{k}"] = {pk: copy.deepcopy(prev[pk]) for pk in person_keys(prev)}
+        self._touch(k)
+        return len(prev)
+    
     def add_skeleton(self, k, img_w, img_h):
         """Add a template skeleton in the image center. All joints start at Confidence 0.0
         (= not placed yet) and become 1.0 once dragged. Returns the new person key."""
