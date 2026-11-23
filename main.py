@@ -50,15 +50,15 @@ def side_color(j):
 class ModelDialog(tk.Toplevel):
     """Modal model picker shown by "Estimate".
     After wait_window(), self.result is (model, detector) as estimators.ModelInfo, or None if cancelled.
-    detector is the YOLO model that supplies person boxes (only for backends with needs_detector)."""
+    detector is the RT-DETR / YOLO model that supplies person boxes (only for backends with
+    needs_detector; YOLO pose finds people with its own boxes)."""
 
-    def __init__(self, parent, models, last=None):
+    def __init__(self, parent, models, detectors, last=None):
         super().__init__(parent)
         self.title("Select pose model")
         self.transient(parent)
         self.resizable(False, False)
-        self.models, self.result = models, None
-        self.yolos = [m for m in models if m.backend == "yolo"]
+        self.models, self.detectors, self.result = models, detectors, None
         last_model, last_det = last or (None, None)
         self.choice = tk.IntVar(value=next((i for i, m in enumerate(models) if m == last_model), 0))
 
@@ -74,13 +74,14 @@ class ModelDialog(tk.Toplevel):
                             command=self._update).pack(anchor="w", padx=(12, 0))
 
         ttk.Separator(frm).pack(fill="x", pady=10)
-        ttk.Label(frm, text="Person detector (ViTPose only):").pack(anchor="w")
+        ttk.Label(frm, text="Person detector for ViTPose (YOLO pose uses its own boxes):").pack(anchor="w")
         self.det_var = tk.StringVar()
         self.det_box = ttk.Combobox(frm, textvariable=self.det_var, state="readonly", width=36,
-                                    values=[m.name for m in self.yolos])
+                                    values=[f"[{estimators.DETECTOR_LABELS[m.backend]}] {m.name}"
+                                            for m in detectors])
         self.det_box.pack(anchor="w", pady=(2, 0))
-        if self.yolos:
-            self.det_box.current(self.yolos.index(last_det) if last_det in self.yolos else 0)
+        if detectors:
+            self.det_box.current(detectors.index(last_det) if last_det in detectors else 0)
 
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=(12, 0))
@@ -102,15 +103,15 @@ class ModelDialog(tk.Toplevel):
     def _update(self):
         need = self._needs_detector()
         self.det_box.config(state="readonly" if need else "disabled")
-        missing = need and not self.yolos
-        self.note.config(text="ViTPose needs a YOLO model in models/yolo/ for person boxes."
+        missing = need and not self.detectors
+        self.note.config(text="ViTPose needs a person detector: RT-DETR in models/rtdetr/ or YOLO in models/yolo/."
                          if missing else "")
         self.btn_run.state(["disabled" if missing else "!disabled"])
 
     def _ok(self):
         if self.btn_run.instate(["disabled"]):
             return
-        det = self.yolos[self.det_box.current()] if self._needs_detector() else None
+        det = self.detectors[self.det_box.current()] if self._needs_detector() else None
         self.result = (self.models[self.choice.get()], det)
         self.destroy()
 
@@ -797,7 +798,7 @@ class PoseEditorApp:
                 "Put YOLO pose models (*.pt) in models/yolo/\n"
                 "and ViTPose HuggingFace folders in models/vitpose/.", parent=self.root)
             return
-        dlg = ModelDialog(self.root, models, last=self.last_model)
+        dlg = ModelDialog(self.root, models, estimators.scan_detectors(MODEL_DIR), last=self.last_model)
         self.root.wait_window(dlg)
         if dlg.result is None:
             return

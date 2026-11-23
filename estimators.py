@@ -4,6 +4,7 @@ estimators.py - pose estimation backends for the Pose Annotation Tool.
   * Model discovery: one sub-folder of models/ per framework
         models/yolo/*.pt               YOLO pose (also any *.pt directly under models/, legacy)
         models/vitpose/<name>/         ViTPose HuggingFace folder (config.json + model.safetensors)
+        models/rtdetr/<name>/          RT-DETR HuggingFace folder, person detector for ViTPose
         models/openpose/               reserved, not implemented yet
   * estimate_pose(): runs the chosen backend on every frame; the output format is identical
     for every backend (COCO 17 keypoints, person_0 = highest box confidence)
@@ -24,9 +25,24 @@ YOLO_CONF = 0.25      # person box confidence threshold (same default as bp_pred
 
 @dataclass(frozen=True)
 class ModelInfo:
-    backend: str      # key of BACKENDS
+    backend: str      # key of BACKENDS, or "rtdetr" (person detector only)
     name: str         # display name
-    path: str         # .pt file (YOLO) or model folder (ViTPose)
+    path: str         # .pt file (YOLO) or model folder (ViTPose / RT-DETR)
+
+
+def hf_folders(models_dir, sub, model_types):
+    """HuggingFace model folders under models_dir/sub whose config.json model_type is in model_types."""
+    out = []
+    for d in sorted(glob.glob(os.path.join(models_dir, sub, "*", "")),
+                    key=lambda p: natural_key(os.path.basename(os.path.normpath(p)))):
+        try:
+            with open(os.path.join(d, "config.json"), encoding="utf-8") as f:
+                if json.load(f).get("model_type") not in model_types:
+                    continue
+        except (OSError, ValueError):
+            continue
+        out.append(os.path.normpath(d))
+    return out
 
 
 # ==========================================
@@ -72,47 +88,81 @@ class YoloBackend:
 
 
 # ==========================================
-# ViTPose (top-down: YOLO person boxes -> ViTPose keypoints)
+# Person detectors (supply boxes to top-down backends): RT-DETR folders or YOLO .pt files
+# ==========================================
+DETECTOR_LABELS = {"rtdetr": "RT-DETR", "yolo": "YOLO"}
+
+
+def scan_detectors(models_dir):
+    """Every usable person detector: RT-DETR folders under models_dir/rtdetr/, then YOLO models."""
+    return ([ModelInfo("rtdetr", os.path.basename(d), d)
+             for d in hf_folders(models_dir, "rtdetr", ("rt_detr", "rt_detr_v2"))]
+            + YoloBackend.scan(models_dir))
+
+
+def load_detector(detector, conf, device):
+    """Returns detect(img, imgsz) -> (boxes as [[x1, y1, x2, y2]], box confidences) for persons only.
+    img is BGR; imgsz is only used by YOLO (RT-DETR's processor resizes by itself)."""
+    import cv2
+    import torch
+
+    if detector.backend == "yolo":
+        from ultralytics import YOLO
+        det = YOLO(detector.path)
+
+        def detect(img, imgsz):
+            r = det.predict(img, imgsz=imgsz, conf=conf, classes=[0], verbose=False)[0]
+            if r.boxes is None or len(r.boxes) == 0:
+                return [], []
+            return r.boxes.xyxy.cpu().tolist(), r.boxes.conf.cpu().tolist()
+        return detect
+
+    from transformers import AutoImageProcessor, AutoModelForObjectDetection
+    processor = AutoImageProcessor.from_pretrained(detector.path)
+    net = AutoModelForObjectDetection.from_pretrained(detector.path).to(device).eval()
+    person = next((int(i) for i, n in net.config.id2label.items() if n == "person"), 0)
+
+    def detect(img, imgsz):
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        inputs = processor(images=rgb, return_tensors="pt").to(device)
+        with torch.no_grad():
+            outputs = net(**inputs)
+        r = processor.post_process_object_detection(
+            outputs, target_sizes=torch.tensor([rgb.shape[:2]]), threshold=conf)[0]
+        keep = r["labels"] == person
+        return r["boxes"][keep].cpu().tolist(), r["scores"][keep].cpu().tolist()
+    return detect
+
+
+# ==========================================
+# ViTPose (top-down: detector person boxes -> ViTPose keypoints)
 # ==========================================
 class VitPoseBackend:
     key, label, needs_detector = "vitpose", "ViTPose", True
 
     @staticmethod
     def scan(models_dir):
-        out = []
-        for d in sorted(glob.glob(os.path.join(models_dir, "vitpose", "*", "")),
-                        key=lambda p: natural_key(os.path.basename(os.path.normpath(p)))):
-            try:
-                with open(os.path.join(d, "config.json"), encoding="utf-8") as f:
-                    if json.load(f).get("model_type") != "vitpose":
-                        continue
-            except (OSError, ValueError):
-                continue
-            d = os.path.normpath(d)
-            out.append(ModelInfo("vitpose", os.path.basename(d), d))
-        return out
+        return [ModelInfo("vitpose", os.path.basename(d), d)
+                for d in hf_folders(models_dir, "vitpose", ("vitpose",))]
 
     @staticmethod
     def load(model, detector, conf):
         import cv2
         import torch
-        from ultralytics import YOLO
         from transformers import AutoProcessor, VitPoseForPoseEstimation
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        det = YOLO(detector.path)
+        detect = load_detector(detector, conf, device)
         processor = AutoProcessor.from_pretrained(model.path)
         net = VitPoseForPoseEstimation.from_pretrained(model.path).to(device).eval()
         # ViTPose++ (mixture of experts) needs to know which dataset head to use; 0 = COCO
         moe = getattr(net.config.backbone_config, "num_experts", 1) > 1
 
         def predict(img, imgsz):
-            r = det.predict(img, imgsz=imgsz, conf=conf, classes=[0], verbose=False)[0]
-            if r.boxes is None or len(r.boxes) == 0:
+            xyxy, bconf = detect(img, imgsz)
+            if not xyxy:
                 return []
-            xyxy = r.boxes.xyxy.cpu().numpy()
-            bconf = r.boxes.conf.cpu().numpy().tolist()
-            boxes = [[x1, y1, x2 - x1, y2 - y1] for x1, y1, x2, y2 in xyxy.tolist()]   # COCO x, y, w, h
+            boxes = [[x1, y1, x2 - x1, y2 - y1] for x1, y1, x2, y2 in xyxy]   # COCO x, y, w, h
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             inputs = processor(rgb, boxes=[boxes], return_tensors="pt").to(device)
             if moe:
@@ -163,12 +213,12 @@ def scan_models(models_dir):
 # ==========================================
 def estimate_pose(src, model, detector=None, conf=YOLO_CONF, progress=None, should_stop=None):
     """Run `model` (a ModelInfo) on every frame of `src` (a file_reader.FrameSource).
-    detector: YOLO ModelInfo that supplies person boxes, for backends with needs_detector.
+    detector: ModelInfo from scan_detectors() that supplies person boxes, for backends with needs_detector.
     progress(k, total) is called after each frame; should_stop() is polled before each frame.
     Returns (pose, stats), or None if stopped. Output format is identical to bp_predict."""
     backend = BACKENDS[model.backend]
     if backend.needs_detector and detector is None:
-        raise ValueError(f"{backend.label} needs a YOLO person detector")
+        raise ValueError(f"{backend.label} needs a person detector")
     predict = backend.load(model, detector, conf)
     pose, prev, imgsz = {}, {}, None
     n_empty = n_weak = k = 0

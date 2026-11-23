@@ -1,4 +1,6 @@
 yolo/      : YOLO pose models (*.pt), e.g. yolo26x-pose.pt
 vitpose/   : ViTPose HuggingFace folders, e.g. vitpose-base-simple/
              https://huggingface.co/usyd-community/vitpose-base-simple
+rtdetr/    : RT-DETR HuggingFace folders, person detector for ViTPose (YOLO models work too)
+             https://huggingface.co/PekingU/rtdetr_r50vd_coco_o365
 openpose/  : reserved

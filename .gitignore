@@ -6,3 +6,4 @@
 !/models/*/.gitkeep
 
 __pycache__/
+*.pyc
