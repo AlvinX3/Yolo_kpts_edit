@@ -1,7 +1,6 @@
 """
 tool.py - pose data model and every skeleton operation.
 
-  * YOLO pose estimation (output identical to bp_predict)
   * PoseDoc: joint hit-testing, dragging, visibility toggling,
     adding / deleting / reordering skeletons, undo, bp_Dis recomputation
 
@@ -40,7 +39,6 @@ TEMPLATE = [(0, .08), (.03, .06), (-.03, .06), (.06, .08), (-.06, .08),
 
 CONF_TH = 0.5         # joint "reliable" threshold (same as training gt_mask)
 WEAK_TH = 12          # frames where person_0 has fewer reliable joints are suspicious
-YOLO_CONF = 0.25      # person box confidence threshold (same default as bp_predict)
 UNDO_LIMIT = 200
 
 
@@ -74,64 +72,6 @@ def recompute_bp_dis(pose):
             p["bp_Dis"] = bp_displacement(prev[pk], p["keypoints"]) if pk in prev else {}
             cur[pk] = p["keypoints"]
         prev = cur
-
-
-# ==========================================
-# YOLO estimation
-# ==========================================
-def extract_persons(r):
-    """Same as _extract_persons in the original main.py:
-    returns [(box_conf, keypoints)], highest box confidence first."""
-    if r.keypoints is None or len(r.keypoints) == 0:
-        return []
-    kpts = r.keypoints.xy.cpu().numpy().tolist()
-    kconf = (r.keypoints.conf.cpu().numpy().tolist() if r.keypoints.conf is not None
-             else [[1.0] * len(k) for k in kpts])
-    bconf = (r.boxes.conf.cpu().numpy().tolist() if r.boxes is not None and r.boxes.conf is not None
-             else [1.0] * len(kpts))
-    persons = []
-    for pk, pc, bc in zip(kpts, kconf, bconf):
-        kp = {f"bonepoint_{i}": {"x": round(pt[0], 2), "y": round(pt[1], 2), "Confidence": round(c, 4)}
-              for i, (pt, c) in enumerate(zip(pk, pc))}
-        persons.append((bc, kp))
-    persons.sort(key=lambda x: -x[0])
-    return persons
-
-
-def estimate_pose(src, model_path, conf=YOLO_CONF, progress=None, should_stop=None):
-    """Run YOLO pose on every frame of `src` (a file_reader.FrameSource).
-    progress(k, total) is called after each frame; should_stop() is polled before each frame.
-    Returns (pose, stats), or None if stopped. Output format is identical to bp_predict."""
-    from ultralytics import YOLO          # imported lazily: only needed when estimating
-    model = YOLO(model_path)
-    pose, prev, imgsz = {}, {}, None
-    n_empty = n_weak = k = 0
-    while True:
-        if should_stop and should_stop():
-            return None
-        img = src.get(k + 1)
-        if img is None:
-            break
-        k += 1
-        if imgsz is None:
-            imgsz = math.ceil(max(img.shape[:2]) / 32) * 32
-        r = model.predict(img, imgsz=imgsz, conf=conf, verbose=False)[0]
-        fd, cur = {}, {}
-        for i, (bc, kp) in enumerate(extract_persons(r)):
-            pk = f"person_{i}"
-            fd[pk] = {"keypoints": kp,
-                      "bp_Dis": bp_displacement(prev[pk], kp) if pk in prev else {},
-                      "box_conf": round(bc, 4)}
-            cur[pk] = kp
-        pose[f"frame_{k}"] = fd
-        prev = cur
-        n_empty += int(not fd)
-        n_weak += int(bool(fd) and good_count(fd["person_0"]) < WEAK_TH)
-        if progress:
-            progress(k, src.total)
-    if k == 0:
-        raise RuntimeError("The source has no readable frames")
-    return pose, {"imgsz": imgsz, "n_empty": n_empty, "n_weak": n_weak}
 
 
 # ==========================================

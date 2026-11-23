@@ -1,7 +1,8 @@
 """
 main.py - Pose Annotation Tool: window, drawing, input handling and workflow control.
 
-Workflow: choose "Video / Folder" -> Open Source -> Open Pose JSON (or "Estimate" to run YOLO)
+Workflow: choose "Video / Folder" -> Open Source -> Open Pose JSON
+          (or "Estimate" -> pick a YOLO / ViTPose model from models/)
           -> review frame by frame -> drag joints / add skeletons -> Save
 Mouse:    left-drag a joint | right-click a joint = toggle visible / invisible
           mouse wheel = magnifier zoom
@@ -12,7 +13,8 @@ Keys:     Left / Right = previous / next frame | M = magnifier on / off | F = sw
 
 Modules:
   file_reader.py : frame sources, pose JSON / meta / backup file I/O
-  tool.py        : pose data model, YOLO estimation, skeleton operations, magnifier
+  tool.py        : pose data model, skeleton operations, magnifier
+  estimators.py  : model discovery and pose estimation backends (YOLO, ViTPose)
   main.py        : this file
 """
 import os
@@ -25,6 +27,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 import cv2
 from PIL import Image, ImageTk
 
+import estimators
 import file_reader
 import tool
 
@@ -42,6 +45,74 @@ PERSON_COLORS = ["#00ff00", "#ff8c00", "#ff00ff", "#00c8ff", "#ffff00"]   # limb
 def side_color(j):
     """Joint color: nose white, left side blue, right side red."""
     return "#ffffff" if j == 0 else ("#3fa9ff" if j % 2 else "#ff5c5c")
+
+
+class ModelDialog(tk.Toplevel):
+    """Modal model picker shown by "Estimate".
+    After wait_window(), self.result is (model, detector) as estimators.ModelInfo, or None if cancelled.
+    detector is the YOLO model that supplies person boxes (only for backends with needs_detector)."""
+
+    def __init__(self, parent, models, last=None):
+        super().__init__(parent)
+        self.title("Select pose model")
+        self.transient(parent)
+        self.resizable(False, False)
+        self.models, self.result = models, None
+        self.yolos = [m for m in models if m.backend == "yolo"]
+        last_model, last_det = last or (None, None)
+        self.choice = tk.IntVar(value=next((i for i, m in enumerate(models) if m == last_model), 0))
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+        group = None
+        for i, m in enumerate(models):                     # models arrive grouped by backend
+            if m.backend != group:
+                group = m.backend
+                ttk.Label(frm, text=estimators.BACKENDS[group].label,
+                          font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6 if i else 0, 2))
+            ttk.Radiobutton(frm, text=m.name, value=i, variable=self.choice,
+                            command=self._update).pack(anchor="w", padx=(12, 0))
+
+        ttk.Separator(frm).pack(fill="x", pady=10)
+        ttk.Label(frm, text="Person detector (ViTPose only):").pack(anchor="w")
+        self.det_var = tk.StringVar()
+        self.det_box = ttk.Combobox(frm, textvariable=self.det_var, state="readonly", width=36,
+                                    values=[m.name for m in self.yolos])
+        self.det_box.pack(anchor="w", pady=(2, 0))
+        if self.yolos:
+            self.det_box.current(self.yolos.index(last_det) if last_det in self.yolos else 0)
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="Cancel", command=self.destroy).pack(side="right")
+        self.btn_run = ttk.Button(btns, text="Run", command=self._ok)
+        self.btn_run.pack(side="right", padx=4)
+        self.note = ttk.Label(frm, foreground="#c00000")
+        self.note.pack(anchor="w")
+
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._update()
+        self.grab_set()
+        self.btn_run.focus_set()
+
+    def _needs_detector(self):
+        return estimators.BACKENDS[self.models[self.choice.get()].backend].needs_detector
+
+    def _update(self):
+        need = self._needs_detector()
+        self.det_box.config(state="readonly" if need else "disabled")
+        missing = need and not self.yolos
+        self.note.config(text="ViTPose needs a YOLO model in models/yolo/ for person boxes."
+                         if missing else "")
+        self.btn_run.state(["disabled" if missing else "!disabled"])
+
+    def _ok(self):
+        if self.btn_run.instate(["disabled"]):
+            return
+        det = self.yolos[self.det_box.current()] if self._needs_detector() else None
+        self.result = (self.models[self.choice.get()], det)
+        self.destroy()
 
 
 class PoseEditorApp:
@@ -63,7 +134,7 @@ class PoseEditorApp:
         self.mag = tool.Magnifier(size=LOUPE_SIZE, zoom=4)
         self.mouse = None                           # last cursor position on the canvas
         self.sel, self.hint = None, ""
-        self.model_path = None                      # init set none
+        self.last_model = None                      # (model, detector) chosen in the last Estimate
         self.worker, self.q, self.stop_evt = None, queue.Queue(), threading.Event()
 
         self._build_ui()
@@ -244,6 +315,8 @@ class PoseEditorApp:
                                         parent=self.root)
         if ans is None:
             return False
+        if ans:
+            return self.save()      # False if the user cancels the Save As dialog -> abort
         return True
 
     def open_source(self):
@@ -715,21 +788,24 @@ class PoseEditorApp:
                 f"{jp}\nalready exists. Re-estimating will overwrite it and discard manual edits. Continue?",
                 parent=self.root):
             return
-        
-        if not (self.model_path and os.path.isfile(self.model_path)):
-            self.model_path = file_reader.find_model(MODEL_DIR)
-        if not self.model_path:
-            mp = filedialog.askopenfilename(
-                title="No *.pt found in models folder - select a YOLO pose model",
-                initialdir=MODEL_DIR if os.path.isdir(MODEL_DIR) else os.getcwd(),
-                filetypes=[("PyTorch model", "*.pt")], parent=self.root)
-            if not mp:
-                return
-            self.model_path = mp
+
+        models = estimators.scan_models(MODEL_DIR)
+        if not models:
+            messagebox.showerror(
+                "No model found",
+                f"No pose model found in\n{MODEL_DIR}\n\n"
+                "Put YOLO pose models (*.pt) in models/yolo/\n"
+                "and ViTPose HuggingFace folders in models/vitpose/.", parent=self.root)
+            return
+        dlg = ModelDialog(self.root, models, last=self.last_model)
+        self.root.wait_window(dlg)
+        if dlg.result is None:
+            return
+        self.last_model = model, detector = dlg.result
 
         self.stop_evt.clear()
         self.worker = threading.Thread(target=self._estimate_thread, daemon=True,
-                                       args=(self.src_path, self.src.mode, self.model_path, jp))
+                                       args=(self.src_path, self.src.mode, model, detector, jp))
         self.worker.start()
         self.btn_est.config(text="Stop")
         for w in self.lock_widgets:
@@ -738,22 +814,25 @@ class PoseEditorApp:
         self.prog.pack(side="right")
         self.root.after(100, self.poll_worker)
 
-    def _estimate_thread(self, path, mode, model_path, json_path):
+    def _estimate_thread(self, path, mode, model, detector, json_path):
         """Runs in a background thread; talks to the UI only through self.q."""
         q, src = self.q, None
         try:
-            q.put(("msg", f"Loading YOLO model {os.path.basename(model_path)}..."))
+            label = estimators.BACKENDS[model.backend].label
+            q.put(("msg", f"Loading {label} model {model.name}..."))
             src = file_reader.FrameSource(path, mode)        # separate reader from the UI's
-            result = tool.estimate_pose(src, model_path,
-                                        progress=lambda k, total: q.put(("progress", k, total)),
-                                        should_stop=self.stop_evt.is_set)
+            result = estimators.estimate_pose(src, model, detector,
+                                              progress=lambda k, total: q.put(("progress", k, total)),
+                                              should_stop=self.stop_evt.is_set)
             if result is None:
                 q.put(("stopped",))
                 return
             pose, stats = result
             file_reader.save_estimation(json_path, pose, {
-                "source": os.path.abspath(path), "model": os.path.abspath(model_path),
-                "imgsz": stats["imgsz"], "conf": tool.YOLO_CONF, "n_frames": len(pose),
+                "source": os.path.abspath(path), "backend": model.backend,
+                "model": os.path.abspath(model.path),
+                "detector": os.path.abspath(detector.path) if detector else None,
+                "imgsz": stats["imgsz"], "conf": estimators.YOLO_CONF, "n_frames": len(pose),
                 "person_0": "highest box confidence"})
             q.put(("done", json_path, pose, stats))
         except Exception as e:
@@ -778,7 +857,7 @@ class PoseEditorApp:
                 elif msg[0] == "progress":
                     k, total = msg[1], msg[2]
                     self.prog.config(maximum=total or k, value=k)
-                    self.status.config(text=f"Running YOLO... frame {k}" + (f" / {total}" if total else ""))
+                    self.status.config(text=f"Estimating... frame {k}" + (f" / {total}" if total else ""))
                 elif msg[0] == "done":
                     _, jp, pose, stats = msg
                     self._finish_estimate()
@@ -788,7 +867,8 @@ class PoseEditorApp:
                     self.show_frame(1)
                     messagebox.showinfo(
                         "Estimation finished",
-                        f"Model: {os.path.basename(self.model_path)}\n"
+                        f"Model: {self.last_model[0].name}"
+                        + (f" (detector {self.last_model[1].name})" if self.last_model[1] else "") + "\n"
                         f"Written to {jp}\n{len(pose)} frames | no person: {stats['n_empty']} | "
                         f"person_0 with < {tool.WEAK_TH} reliable joints: {stats['n_weak']}\n"
                         "Use \"Next Suspicious\" to review them one by one.", parent=self.root)
@@ -812,7 +892,7 @@ class PoseEditorApp:
     # ==========================================
     def quit(self):
         if self.busy():
-            if not messagebox.askyesno("Estimation running", "YOLO is still running. Exit anyway?",
+            if not messagebox.askyesno("Estimation running", "Pose estimation is still running. Exit anyway?",
                                        parent=self.root):
                 return
             self.stop_evt.set()

@@ -1,2 +1,8 @@
 *.mp4
 *.pt
+
+# keep models/<framework>/ folders, but never push the models inside them
+/models/*/*
+!/models/*/.gitkeep
+
+__pycache__/

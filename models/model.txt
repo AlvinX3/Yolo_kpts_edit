@@ -1,1 +1,4 @@
-add yolo model here
+yolo/      : YOLO pose models (*.pt), e.g. yolo26x-pose.pt
+vitpose/   : ViTPose HuggingFace folders, e.g. vitpose-base-simple/
+             https://huggingface.co/usyd-community/vitpose-base-simple
+openpose/  : reserved
